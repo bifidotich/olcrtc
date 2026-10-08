@@ -147,7 +147,13 @@ type Conn struct {
 	send    func([]byte) error
 	canSend func() bool // if nil, uses ln.CanSend
 	keys    *crypto.KeySet
-	aad     []byte
+	// sealer is this conn's own sender nonce state. Sharing one prefix and
+	// counter across the data, control and peer conns let a bulk data stream
+	// push the receiver's 64-record replay window past still-valid control
+	// records ("record too old"), permanently desynchronizing that stream.
+	// Nil only if minting a session failed; Write then falls back to keys.
+	sealer *crypto.Sealer
+	aad    []byte
 
 	in        chan *[]byte
 	closeOnce sync.Once
@@ -177,6 +183,17 @@ func (c *Conn) sendDeadline() time.Duration {
 	return writeReadyTimeout
 }
 
+// newSealer mints a per-conn sender session. It only fails if crypto/rand
+// does, in which case the conn keeps the KeySet's shared default session.
+func newSealer(keys *crypto.KeySet) *crypto.Sealer {
+	sealer, err := keys.Session()
+	if err != nil {
+		logger.Warnf("muxconn: per-conn sealer unavailable, using shared session: %v", err)
+		return nil
+	}
+	return sealer
+}
+
 // New wires a Conn over the given transport. Push must be set as the
 // transport's OnData callback before this conn is used.
 func New(ln transport.Transport, keys *crypto.KeySet) *Conn {
@@ -184,6 +201,7 @@ func New(ln transport.Transport, keys *crypto.KeySet) *Conn {
 		ln:      ln,
 		send:    ln.Send,
 		keys:    keys,
+		sealer:  newSealer(keys),
 		aad:     []byte(dataRecordAAD),
 		in:      make(chan *[]byte, inboundQueue),
 		closeCh: make(chan struct{}),
@@ -203,6 +221,7 @@ func NewControl(ln transport.Transport, keys *crypto.KeySet) *Conn {
 		send:    cp.ControlSend,
 		canSend: cp.ControlCanSend,
 		keys:    keys,
+		sealer:  newSealer(keys),
 		aad:     []byte(controlRecordAAD),
 		in:      make(chan *[]byte, inboundQueue),
 		closeCh: make(chan struct{}),
@@ -219,6 +238,7 @@ func NewPeer(ln transport.PeerTransport, keys *crypto.KeySet, peerID string) *Co
 			return ln.SendTo(peerID, data)
 		},
 		keys:    keys,
+		sealer:  newSealer(keys),
 		aad:     []byte(dataRecordAAD),
 		in:      make(chan *[]byte, inboundQueue),
 		closeCh: make(chan struct{}),
@@ -247,6 +267,7 @@ func NewPeerControlUnbound(ln transport.Transport, keys *crypto.KeySet, peerID s
 			return cp.ControlPeerCanSend(peerID)
 		},
 		keys:    keys,
+		sealer:  newSealer(keys),
 		aad:     []byte(controlRecordAAD),
 		in:      make(chan *[]byte, inboundQueue),
 		closeCh: make(chan struct{}),
@@ -389,7 +410,13 @@ func (c *Conn) Write(p []byte) (int, error) {
 		return 0, err
 	}
 
-	enc, err := c.keys.SealInto(nil, p, c.aad)
+	var enc []byte
+	var err error
+	if c.sealer != nil {
+		enc, err = c.sealer.SealInto(nil, p, c.aad)
+	} else {
+		enc, err = c.keys.SealInto(nil, p, c.aad)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("encrypt: %w", err)
 	}
