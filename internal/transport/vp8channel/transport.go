@@ -163,6 +163,10 @@ type streamTransport struct {
 
 	frameInterval time.Duration
 	batchSize     int
+	// pace limits the data-plane send rate; nil when unpaced (see pace.go).
+	pace *pacer
+	// interframe tags data samples as VP8 interframes (see pace.go).
+	interframe bool
 
 	// localEpoch is stamped into every outgoing VP8 frame. Explicit
 	// upper-layer resets rotate it so the peer can reset its KCP state too.
@@ -265,6 +269,8 @@ func newStreamTransport(
 		writerDone:       make(chan struct{}),
 		frameInterval:    time.Second / time.Duration(opts.FPS),
 		batchSize:        opts.BatchSize,
+		pace:             newPacerFromEnv(),
+		interframe:       interframeFromEnv(),
 		bindingToken:     channelBindingToken(cfg),
 		localEpoch:       randomEpoch(),
 		peerRestartGrace: defaultPeerRestartGrace,

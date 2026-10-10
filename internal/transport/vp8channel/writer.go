@@ -68,16 +68,25 @@ func (w *writerState) writeSample(data []byte) bool {
 func (p *streamTransport) writeSampleLocked(data []byte) bool {
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
+	if p.interframe && len(data) > epochHdrLen {
+		// frame_type bit: 1 = interframe. Only data samples; a bare epoch
+		// header is a keepalive and must stay a decodable keyframe.
+		data[0] |= 0x01
+	}
 	if p.sampleWriter != nil {
 		return p.sampleWriter(data)
 	}
 	if p.track == nil {
 		return false
 	}
-	return p.track.WriteSample(media.Sample{
+	ok := p.track.WriteSample(media.Sample{
 		Data:     data,
 		Duration: p.frameInterval,
 	}) == nil
+	if ok {
+		diagCountTx(len(data))
+	}
+	return ok
 }
 
 // forceKeepalive emits a clean, fully-decodable VP8 keepalive keyframe at a
@@ -136,6 +145,12 @@ func (w *writerState) drainData() {
 	budget := max(w.p.batchSize, 1)
 	sent := 0
 	for sent < budget {
+		if !w.p.pace.ready() {
+			// Out of credit: data waits in the queue, which backs KCP up.
+			// Not idle, so no keepalive either.
+			w.idleTicks = 0
+			return
+		}
 		frame := w.pendingData
 		w.pendingData = nil
 		if frame == nil {
@@ -152,6 +167,7 @@ func (w *writerState) drainData() {
 				w.pendingData = frame
 				return
 			}
+			w.p.pace.spend(len(frame.data))
 			frame.release()
 			sent++
 			continue
@@ -159,6 +175,7 @@ func (w *writerState) drainData() {
 		sample, pending := w.p.batchSampleFrom(w.p.data.out, frame, w.batchBuf[:0])
 		w.pendingData = pending
 		_ = w.writeSample(sample)
+		w.p.pace.spend(len(sample))
 		w.batchBuf = sample[:0]
 		sent++
 	}
@@ -250,7 +267,7 @@ func (p *streamTransport) peerWriterPump(out chan *packetBuffer, done <-chan str
 			// Up to batchSize samples per tick, each within one RTP packet: this
 			// is the server->client bulk path, so it carries the download
 			// direction that Speedtest-style transfers live or die on.
-			for sent := 0; sent < budget; sent++ {
+			for sent := 0; sent < budget && p.pace.ready(); sent++ {
 				frame := pending
 				pending = nil
 				if frame == nil {
@@ -269,12 +286,14 @@ func (p *streamTransport) peerWriterPump(out chan *packetBuffer, done <-chan str
 				}
 				if !p.canBatch(frame.data) {
 					_ = p.writeSampleLocked(frame.data)
+					p.pace.spend(len(frame.data))
 					frame.release()
 					continue
 				}
 				var sample []byte
 				sample, pending = p.batchSampleFrom(out, frame, batchBuf[:0])
 				_ = p.writeSampleLocked(sample)
+				p.pace.spend(len(sample))
 				batchBuf = sample[:0]
 			}
 		}
