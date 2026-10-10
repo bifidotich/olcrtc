@@ -261,6 +261,7 @@ func (p *streamTransport) readVP8Track(track *webrtc.TrackRemote) {
 	var state vp8FrameState
 	reorder := newReorderBuffer()
 	var rtpCount, frameCount int
+	var diag diagRx
 
 	type readResult struct {
 		pkt *rtp.Packet
@@ -301,6 +302,8 @@ func (p *streamTransport) readVP8Track(track *webrtc.TrackRemote) {
 			return
 		}
 		frameCount++
+		diag.frames++
+		diag.frameBytes += len(frame)
 		p.handleIncomingFrame(frame)
 	}
 
@@ -315,9 +318,12 @@ func (p *streamTransport) readVP8Track(track *webrtc.TrackRemote) {
 				return
 			}
 			rtpCount++
+			diag.rtp++
+			diag.rtpBytes += len(res.pkt.Payload)
 			reorder.push(res.pkt, deliver)
 		case <-ticker.C:
 			reorder.flushTimeout(deliver)
+			diag.maybeLog(track.ID())
 		}
 	}
 }

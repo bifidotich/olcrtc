@@ -455,7 +455,11 @@ func (s *Session) handlePublisherRTCP(sender *webrtc.RTPSender, track webrtc.Tra
 	if sender == nil {
 		return
 	}
+	diag := newRTCPDiag()
+	diagDone := make(chan struct{})
+	go diag.run("pub track="+track.ID(), diagDone)
 	go func() {
+		defer close(diagDone)
 		rtcpBuf := make([]byte, 1500)
 		for {
 			n, _, err := sender.Read(rtcpBuf)
@@ -467,6 +471,7 @@ func (s *Session) handlePublisherRTCP(sender *webrtc.RTPSender, track webrtc.Tra
 				continue
 			}
 			for _, pkt := range pkts {
+				diag.observe(pkt)
 				switch pkt.(type) {
 				case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
 					logger.Debugf("goolom: received keyframe request (%T), requesting keyframe", pkt)
